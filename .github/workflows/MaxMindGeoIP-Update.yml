@@ -37,6 +37,14 @@ jobs:
           exit 1
         fi
 
+        # Validate response is actually gzip
+        if ! file GeoLite2-Country.tar.gz | grep -q "gzip compressed"; then
+          echo "❌ Downloaded file is not gzip format. Response content:"
+          cat GeoLite2-Country.tar.gz
+          rm -f GeoLite2-Country.tar.gz
+          exit 1
+        fi
+
         # Extract .mmdb file from tar.gz
         tar -xzf GeoLite2-Country.tar.gz --strip-components=1 --wildcards '*.mmdb'
         mv GeoLite2-Country.mmdb Data/
@@ -50,51 +58,76 @@ jobs:
           exit 1
         fi
 
-    - name: 📥 Download GeoIP2-Anonymous-IP Database (Official)
+    - name: 📥 Download GeoLite2-ASN Database (Official)
       env:
         MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
       run: |
-        echo "Downloading GeoIP2-Anonymous-IP.mmdb from MaxMind official API..."
+        echo "Downloading GeoLite2-ASN.mmdb from MaxMind official API..."
 
         # MaxMind official download URL format
-        DOWNLOAD_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Anonymous-IP&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+        DOWNLOAD_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
 
         # Download and extract
-        curl -L "${DOWNLOAD_URL}" -o GeoLite2-Anonymous-IP.tar.gz
+        curl -L "${DOWNLOAD_URL}" -o GeoLite2-ASN.tar.gz
 
-        if [ ! -f GeoLite2-Anonymous-IP.tar.gz ]; then
-          echo "❌ Failed to download GeoLite2-Anonymous-IP.tar.gz"
+        if [ ! -f GeoLite2-ASN.tar.gz ]; then
+          echo "❌ Failed to download GeoLite2-ASN.tar.gz"
+          exit 1
+        fi
+
+        # Validate response is actually gzip
+        if ! file GeoLite2-ASN.tar.gz | grep -q "gzip compressed"; then
+          echo "❌ Downloaded file is not gzip format. Response content:"
+          cat GeoLite2-ASN.tar.gz
+          rm -f GeoLite2-ASN.tar.gz
           exit 1
         fi
 
         # Extract .mmdb file from tar.gz
-        tar -xzf GeoLite2-Anonymous-IP.tar.gz --strip-components=1 --wildcards '*.mmdb'
-        mv GeoLite2-Anonymous-IP.mmdb Data/
-        rm -f GeoLite2-Anonymous-IP.tar.gz
+        tar -xzf GeoLite2-ASN.tar.gz --strip-components=1 --wildcards '*.mmdb'
+        mv GeoLite2-ASN.mmdb Data/
+        rm -f GeoLite2-ASN.tar.gz
+
+        if [ -f Data/GeoLite2-ASN.mmdb ]; then
+          echo "✅ GeoLite2-ASN.mmdb downloaded successfully"
+          ls -lh Data/GeoLite2-ASN.mmdb
+        else
+          echo "❌ Failed to extract GeoLite2-ASN.mmdb"
+          exit 1
+        fi
+
+    - name: 📥 Download GeoIP2-Anonymous-IP (Fallback Mirror)
+      run: |
+        echo "Downloading GeoIP2-Anonymous-IP.mmdb from mirror..."
+        echo "ℹ️ Note: Anonymous-IP database is not available in free GeoLite2"
+        echo "ℹ️ Using community mirror as fallback"
+
+        # Download from P3TERX mirror
+        curl -L "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoIP2-Anonymous-IP.mmdb" \
+          -o Data/GeoIP2-Anonymous-IP.mmdb
 
         if [ -f Data/GeoIP2-Anonymous-IP.mmdb ]; then
           echo "✅ GeoIP2-Anonymous-IP.mmdb downloaded successfully"
           ls -lh Data/GeoIP2-Anonymous-IP.mmdb
         else
-          echo "❌ Failed to extract GeoIP2-Anonymous-IP.mmdb"
-          exit 1
+          echo "⚠️ GeoIP2-Anonymous-IP.mmdb download failed - skipping"
         fi
 
     - name: 📊 Verify Downloaded Files
       run: |
         echo "Verifying downloaded databases..."
         echo "📂 Data directory contents:"
-        ls -lh Data/*.mmdb
+        ls -lh Data/*.mmdb || echo "No .mmdb files found"
 
         echo ""
         echo "📈 File sizes:"
-        du -h Data/GeoLite2-Country.mmdb
-        du -h Data/GeoIP2-Anonymous-IP.mmdb
+        [ -f Data/GeoLite2-Country.mmdb ] && du -h Data/GeoLite2-Country.mmdb || echo "❌ GeoLite2-Country.mmdb missing"
+        [ -f Data/GeoLite2-ASN.mmdb ] && du -h Data/GeoLite2-ASN.mmdb || echo "❌ GeoLite2-ASN.mmdb missing"
+        [ -f Data/GeoIP2-Anonymous-IP.mmdb ] && du -h Data/GeoIP2-Anonymous-IP.mmdb || echo "⚠️ GeoIP2-Anonymous-IP.mmdb missing"
 
         echo ""
         echo "📅 Last modified dates:"
-        stat -c '%y %n' Data/GeoLite2-Country.mmdb Data/GeoIP2-Anonymous-IP.mmdb || \
-        stat -f '%Sm %N' Data/GeoLite2-Country.mmdb Data/GeoIP2-Anonymous-IP.mmdb
+        stat -c '%y %n' Data/*.mmdb 2>/dev/null || stat -f '%Sm %N' Data/*.mmdb 2>/dev/null || echo "Unable to stat files"
 
     - name: 📤 Commit and Push Changes
       if: ${{ success() }}
@@ -104,7 +137,8 @@ jobs:
 
         # Add the downloaded databases
         git add Data/GeoLite2-Country.mmdb
-        git add Data/GeoIP2-Anonymous-IP.mmdb
+        git add Data/GeoLite2-ASN.mmdb
+        git add Data/GeoIP2-Anonymous-IP.mmdb 2>/dev/null || true
 
         # Check if there are changes to commit
         if git diff --staged --quiet; then
