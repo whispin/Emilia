@@ -1,0 +1,152 @@
+name: AbuseIPDB Blacklist Update
+
+on:
+  workflow_dispatch: # Allow manual trigger
+  schedule:
+    - cron: '30 5,11,17,23 * * *'  # Run at 5:30, 11:30, 17:30, 23:30 UTC daily
+
+jobs:
+  update-blacklist:
+    runs-on: ubuntu-latest
+    name: 📥 Download AbuseIPDB Blacklist
+
+    steps:
+    - name: 📂 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GIT_TOKEN }}
+
+    - name: 📁 Ensure Data Directory Exists
+      run: mkdir -p Data
+
+    - name: 📥 Download AbuseIPDB Blacklist
+      env:
+        ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
+      run: |
+        echo "Downloading AbuseIPDB blacklist (confidence >= 75%)..."
+
+        # AbuseIPDB API endpoint with parameters
+        API_URL="https://api.abuseipdb.com/api/v2/blacklist"
+
+        # Download CSV with API key in header
+        curl -G "${API_URL}" \
+          -H "Key: ${ABUSEIPDB_API_KEY}" \
+          -H "Accept: text/plain" \
+          -d confidenceMinimum=75 \
+          -d limit=10000 \
+          -o abuseipdb_raw.csv
+
+        if [ ! -f abuseipdb_raw.csv ]; then
+          echo "❌ Failed to download AbuseIPDB blacklist"
+          exit 1
+        fi
+
+        # Check if file contains data (not just headers or error message)
+        if [ ! -s abuseipdb_raw.csv ]; then
+          echo "❌ Downloaded file is empty"
+          cat abuseipdb_raw.csv
+          exit 1
+        fi
+
+        # Check if file is CSV format (should start with IP address pattern)
+        if ! head -5 abuseipdb_raw.csv | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+          echo "❌ Downloaded file does not appear to be valid CSV format"
+          echo "First 10 lines:"
+          head -10 abuseipdb_raw.csv
+          exit 1
+        fi
+
+        echo "✅ AbuseIPDB blacklist downloaded successfully"
+        wc -l abuseipdb_raw.csv
+
+    - name: 🔄 Convert CSV to Custom Format
+      run: |
+        echo "Converting CSV to custom format: ip,country_code,abuse_confidence_score"
+
+        # Process CSV and extract required fields
+        # Expected CSV format: ipAddress,abuseConfidenceScore[,countryCode]
+        # Output format: ip,country_code,abuse_confidence_score
+
+        # Skip header and process each line
+        tail -n +2 abuseipdb_raw.csv | while IFS=',' read -r ip confidence country_code other_fields; do
+          # Remove quotes and whitespace
+          ip=$(echo "$ip" | tr -d '"' | xargs)
+          confidence=$(echo "$confidence" | tr -d '"' | xargs)
+          country_code=$(echo "$country_code" | tr -d '"' | xargs)
+
+          # Set default country code if empty
+          [ -z "$country_code" ] && country_code="UNKNOWN"
+
+          # Output in required format
+          echo "${ip},${country_code},${confidence}"
+        done > Data/abuseips.txt
+
+        if [ ! -f Data/abuseips.txt ]; then
+          echo "❌ Failed to create abuseips.txt"
+          exit 1
+        fi
+
+        echo "✅ Conversion completed successfully"
+        echo "📊 Total IPs processed: $(wc -l < Data/abuseips.txt)"
+        echo ""
+        echo "📋 Sample of first 5 entries:"
+        head -5 Data/abuseips.txt
+
+        # Cleanup temporary file
+        rm -f abuseipdb_raw.csv
+
+    - name: 📊 Verify Output File
+      run: |
+        echo "Verifying abuseips.txt format..."
+
+        if [ ! -f Data/abuseips.txt ]; then
+          echo "❌ abuseips.txt not found"
+          exit 1
+        fi
+
+        # Check file has content
+        line_count=$(wc -l < Data/abuseips.txt)
+        if [ "$line_count" -lt 1 ]; then
+          echo "❌ abuseips.txt is empty"
+          exit 1
+        fi
+
+        echo "✅ File verification passed"
+        echo "📈 Statistics:"
+        echo "   Total entries: $line_count"
+        echo "   File size: $(du -h Data/abuseips.txt | cut -f1)"
+
+        # Show country distribution (top 10)
+        echo ""
+        echo "🌍 Top 10 countries by IP count:"
+        cut -d',' -f2 Data/abuseips.txt | sort | uniq -c | sort -rn | head -10
+
+        # Show confidence score distribution
+        echo ""
+        echo "📊 Confidence score ranges:"
+        echo "   75-84: $(awk -F',' '$3 >= 75 && $3 < 85' Data/abuseips.txt | wc -l)"
+        echo "   85-94: $(awk -F',' '$3 >= 85 && $3 < 95' Data/abuseips.txt | wc -l)"
+        echo "   95-100: $(awk -F',' '$3 >= 95' Data/abuseips.txt | wc -l)"
+
+    - name: 📤 Commit and Push Changes
+      if: ${{ success() }}
+      run: |
+        git config --global user.name "Github Actions"
+        git config --global user.email "actions@github.com"
+
+        # Add the blacklist file
+        git add Data/abuseips.txt
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "ℹ️ No changes to commit - blacklist is up to date"
+        else
+          # Get current timestamp
+          timestamp=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          git commit -m "🚫 Update AbuseIPDB blacklist - ${timestamp}"
+          git push origin main
+          echo "✅ Successfully updated AbuseIPDB blacklist"
+        fi
+      shell: bash
