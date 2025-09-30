@@ -20,45 +20,109 @@ jobs:
     - name: 📁 Ensure Data Directory Exists
       run: mkdir -p Data
 
-    - name: 📥 Download AbuseIPDB Blacklist
+    - name: 📥 Download AbuseIPDB Blacklist (Multi-Key Retry)
       env:
-        ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
+        ABUSEIPDB_API_KEYS: ${{ secrets.ABUSEIPDB_API_KEYS }}
       run: |
         echo "Downloading AbuseIPDB blacklist (confidence >= 75%)..."
+        echo "Using multi-key retry strategy for free tier limits"
 
-        # AbuseIPDB API endpoint with parameters
+        # AbuseIPDB API endpoint
         API_URL="https://api.abuseipdb.com/api/v2/blacklist"
 
-        # Download CSV with API key in header
-        curl -G "${API_URL}" \
-          -H "Key: ${ABUSEIPDB_API_KEY}" \
-          -H "Accept: text/plain" \
-          -d confidenceMinimum=75 \
-          -d limit=10000 \
-          -o abuseipdb_raw.csv
-
-        if [ ! -f abuseipdb_raw.csv ]; then
-          echo "❌ Failed to download AbuseIPDB blacklist"
+        # Parse comma-separated API keys
+        if [ -z "$ABUSEIPDB_API_KEYS" ]; then
+          echo "❌ No API keys configured. Please set ABUSEIPDB_API_KEYS secret"
+          echo "   Format: key1,key2,key3 (comma-separated)"
           exit 1
         fi
 
-        # Check if file contains data (not just headers or error message)
-        if [ ! -s abuseipdb_raw.csv ]; then
-          echo "❌ Downloaded file is empty"
-          cat abuseipdb_raw.csv
+        # Split API keys by comma into array
+        IFS=',' read -ra API_KEYS <<< "$ABUSEIPDB_API_KEYS"
+
+        # Trim whitespace from each key
+        for i in "${!API_KEYS[@]}"; do
+          API_KEYS[$i]=$(echo "${API_KEYS[$i]}" | xargs)
+        done
+
+        if [ ${#API_KEYS[@]} -eq 0 ]; then
+          echo "❌ No valid API keys found after parsing"
           exit 1
         fi
 
-        # Check if file is CSV format (should start with IP address pattern)
-        if ! head -5 abuseipdb_raw.csv | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
-          echo "❌ Downloaded file does not appear to be valid CSV format"
-          echo "First 10 lines:"
-          head -10 abuseipdb_raw.csv
+        echo "ℹ️ Found ${#API_KEYS[@]} API key(s) configured"
+
+        # Try each API key until one succeeds
+        SUCCESS=false
+        for i in "${!API_KEYS[@]}"; do
+          KEY_NUM=$((i + 1))
+          API_KEY="${API_KEYS[$i]}"
+
+          echo ""
+          echo "🔄 Attempt $KEY_NUM/${#API_KEYS[@]} - Using API Key #$KEY_NUM"
+
+          # Download with current API key
+          HTTP_CODE=$(curl -G "${API_URL}" \
+            -H "Key: ${API_KEY}" \
+            -H "Accept: text/plain" \
+            -d confidenceMinimum=75 \
+            -d limit=10000 \
+            -w "%{http_code}" \
+            -o abuseipdb_raw.csv \
+            -s)
+
+          echo "   HTTP Status: $HTTP_CODE"
+
+          # Check HTTP status code
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "   ⚠️ API Key #$KEY_NUM failed with HTTP $HTTP_CODE"
+
+            # Show error message if available
+            if [ -f abuseipdb_raw.csv ] && [ -s abuseipdb_raw.csv ]; then
+              echo "   Error message:"
+              head -3 abuseipdb_raw.csv | sed 's/^/      /'
+            fi
+
+            rm -f abuseipdb_raw.csv
+            continue
+          fi
+
+          # Verify file exists and has content
+          if [ ! -f abuseipdb_raw.csv ] || [ ! -s abuseipdb_raw.csv ]; then
+            echo "   ⚠️ API Key #$KEY_NUM: Downloaded file is empty or missing"
+            rm -f abuseipdb_raw.csv
+            continue
+          fi
+
+          # Verify CSV format (should contain IP addresses)
+          if ! head -5 abuseipdb_raw.csv | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "   ⚠️ API Key #$KEY_NUM: Invalid CSV format (no IP addresses found)"
+            echo "   First 3 lines:"
+            head -3 abuseipdb_raw.csv | sed 's/^/      /'
+            rm -f abuseipdb_raw.csv
+            continue
+          fi
+
+          # Success!
+          echo "   ✅ API Key #$KEY_NUM succeeded!"
+          SUCCESS=true
+          break
+        done
+
+        # Check if any key succeeded
+        if [ "$SUCCESS" = false ]; then
+          echo ""
+          echo "❌ All API keys exhausted. Failed to download blacklist."
+          echo "💡 Possible reasons:"
+          echo "   - All keys have reached daily limit (5 downloads/day for free tier)"
+          echo "   - Network issues or API service down"
+          echo "   - Invalid API keys"
           exit 1
         fi
 
+        echo ""
         echo "✅ AbuseIPDB blacklist downloaded successfully"
-        wc -l abuseipdb_raw.csv
+        echo "📊 Total lines: $(wc -l < abuseipdb_raw.csv)"
 
     - name: 🔄 Convert CSV to Custom Format
       run: |
