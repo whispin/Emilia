@@ -1,0 +1,117 @@
+name: MaxMind GeoIP Database Update
+
+on:
+  workflow_dispatch: # Allow manual trigger
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at 00:00 UTC
+
+jobs:
+  update-geoip:
+    runs-on: ubuntu-latest
+    name: 📥 Download MaxMind GeoIP Databases
+
+    steps:
+    - name: 📂 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GIT_TOKEN }}
+
+    - name: 📁 Ensure Data Directory Exists
+      run: mkdir -p Data
+
+    - name: 📥 Download GeoLite2-Country Database (Official)
+      env:
+        MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+      run: |
+        echo "Downloading GeoLite2-Country.mmdb from MaxMind official API..."
+
+        # MaxMind official download URL format
+        DOWNLOAD_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+
+        # Download and extract
+        curl -L "${DOWNLOAD_URL}" -o GeoLite2-Country.tar.gz
+
+        if [ ! -f GeoLite2-Country.tar.gz ]; then
+          echo "❌ Failed to download GeoLite2-Country.tar.gz"
+          exit 1
+        fi
+
+        # Extract .mmdb file from tar.gz
+        tar -xzf GeoLite2-Country.tar.gz --strip-components=1 --wildcards '*.mmdb'
+        mv GeoLite2-Country.mmdb Data/
+        rm -f GeoLite2-Country.tar.gz
+
+        if [ -f Data/GeoLite2-Country.mmdb ]; then
+          echo "✅ GeoLite2-Country.mmdb downloaded successfully"
+          ls -lh Data/GeoLite2-Country.mmdb
+        else
+          echo "❌ Failed to extract GeoLite2-Country.mmdb"
+          exit 1
+        fi
+
+    - name: 📥 Download GeoIP2-Anonymous-IP Database (Official)
+      env:
+        MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+      run: |
+        echo "Downloading GeoIP2-Anonymous-IP.mmdb from MaxMind official API..."
+
+        # MaxMind official download URL format
+        DOWNLOAD_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Anonymous-IP&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+
+        # Download and extract
+        curl -L "${DOWNLOAD_URL}" -o GeoLite2-Anonymous-IP.tar.gz
+
+        if [ ! -f GeoLite2-Anonymous-IP.tar.gz ]; then
+          echo "❌ Failed to download GeoLite2-Anonymous-IP.tar.gz"
+          exit 1
+        fi
+
+        # Extract .mmdb file from tar.gz
+        tar -xzf GeoLite2-Anonymous-IP.tar.gz --strip-components=1 --wildcards '*.mmdb'
+        mv GeoLite2-Anonymous-IP.mmdb Data/
+        rm -f GeoLite2-Anonymous-IP.tar.gz
+
+        if [ -f Data/GeoIP2-Anonymous-IP.mmdb ]; then
+          echo "✅ GeoIP2-Anonymous-IP.mmdb downloaded successfully"
+          ls -lh Data/GeoIP2-Anonymous-IP.mmdb
+        else
+          echo "❌ Failed to extract GeoIP2-Anonymous-IP.mmdb"
+          exit 1
+        fi
+
+    - name: 📊 Verify Downloaded Files
+      run: |
+        echo "Verifying downloaded databases..."
+        echo "📂 Data directory contents:"
+        ls -lh Data/*.mmdb
+
+        echo ""
+        echo "📈 File sizes:"
+        du -h Data/GeoLite2-Country.mmdb
+        du -h Data/GeoIP2-Anonymous-IP.mmdb
+
+        echo ""
+        echo "📅 Last modified dates:"
+        stat -c '%y %n' Data/GeoLite2-Country.mmdb Data/GeoIP2-Anonymous-IP.mmdb || \
+        stat -f '%Sm %N' Data/GeoLite2-Country.mmdb Data/GeoIP2-Anonymous-IP.mmdb
+
+    - name: 📤 Commit and Push Changes
+      if: ${{ success() }}
+      run: |
+        git config --global user.name "Github Actions"
+        git config --global user.email "actions@github.com"
+
+        # Add the downloaded databases
+        git add Data/GeoLite2-Country.mmdb
+        git add Data/GeoIP2-Anonymous-IP.mmdb
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "ℹ️ No changes to commit - databases are up to date"
+        else
+          git commit -m "🗺️ Update MaxMind GeoIP databases"
+          git push origin main
+          echo "✅ Successfully updated GeoIP databases"
+        fi
+      shell: bash
