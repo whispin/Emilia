@@ -377,7 +377,7 @@ fn get_geo_info(
             let name = country_data
                 .country
                 .as_ref()
-                .and_then(|c| c.names)
+                .and_then(|c| c.names.as_ref())
                 .and_then(|names| {
                     names.get("zh-CN")
                         .or_else(|| names.get("en"))
@@ -398,14 +398,14 @@ fn get_geo_info(
                 let code = city_data
                     .city
                     .as_ref()
-                    .and_then(|c| c.names)
+                    .and_then(|c| c.names.as_ref())
                     .and_then(|names| names.get("en").map(|s| s.to_string()))
                     .unwrap_or_default();
 
                 let name = city_data
                     .city
                     .as_ref()
-                    .and_then(|c| c.names)
+                    .and_then(|c| c.names.as_ref())
                     .and_then(|names| {
                         names.get("zh-CN")
                             .or_else(|| names.get("en"))
