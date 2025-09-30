@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write}; // Read dihapus karena AsyncReadExt akan digunakan
 use std::net::IpAddr;
@@ -6,6 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::StreamExt;
 use ipnetwork::IpNetwork;
 use maxminddb::{geoip2, Reader};
@@ -14,6 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Untuk read_exact, write_all async
 use tokio::net::TcpStream; // TcpStream async dari Tokio
 use tokio_native_tls::TlsConnector as TokioTlsConnector; // Konektor TLS async
+use tokio_postgres::NoTls;
 
 const IP_RESOLVER: &str = "speed.cloudflare.com";
 const PATH_RESOLVER: &str = "/meta";
@@ -28,8 +31,21 @@ const FIREHOL_CIDR_FILE: &str = "Data/firehol_cidr.txt";
 const MAX_CONCURRENT: usize = 175;
 const TIMEOUT_SECONDS: u64 = 9;
 
-// Define a custom error type that implements Send + SData/ProxyIP2Agustus.txtync
+// Define a custom error type that implements Send + Sync
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// 代理数据结构
+#[derive(Debug, Clone)]
+struct ProxyData {
+    ip: String,
+    port: u16,
+    country_code: String,
+    country_name: String,
+    city_code: String,
+    city_name: String,
+    asn_number: String,
+    org_name: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -124,6 +140,12 @@ async fn main() -> Result<()> {
     // Store active proxies
     let active_proxies = Arc::new(Mutex::new(Vec::new()));
 
+    // Initialize PostgreSQL connection pool (optional)
+    let pg_pool = create_pg_pool();
+
+    // Generate batch timestamp for this run
+    let batch_time = chrono::Utc::now();
+
     // Process proxies concurrently
     let tasks = futures::stream::iter(
         proxies.into_iter().map(|proxy_line| {
@@ -162,14 +184,48 @@ async fn main() -> Result<()> {
 
     tasks.await;
 
-    // Save active proxies to file
+    // Save active proxies to file and parse for PostgreSQL
     let active_proxies_locked = active_proxies.lock().unwrap(); // Renamed for clarity
     if !active_proxies_locked.is_empty() {
         let mut file = File::create(OUTPUT_FILE)?; // Buka lagi untuk menulis, ini akan menimpa
-        for proxy in active_proxies_locked.iter() {
-            writeln!(file, "{}", proxy)?;
+        let mut proxy_data_list = Vec::new();
+
+        for proxy_csv in active_proxies_locked.iter() {
+            writeln!(file, "{}", proxy_csv)?;
+
+            // Parse CSV untuk PostgreSQL
+            let parts: Vec<&str> = proxy_csv.split(',').collect();
+            if parts.len() >= 8 {
+                proxy_data_list.push(ProxyData {
+                    ip: parts[0].to_string(),
+                    port: parts[1].parse().unwrap_or(0),
+                    country_code: parts[2].to_string(),
+                    country_name: parts[3].to_string(),
+                    city_code: parts[4].to_string(),
+                    city_name: parts[5].to_string(),
+                    asn_number: parts[6].to_string(),
+                    org_name: parts[7].to_string(),
+                });
+            }
         }
         println!("All active proxies saved to {}", OUTPUT_FILE);
+
+        // Sync to PostgreSQL if available
+        if let Some(pool) = pg_pool {
+            println!("📤 Syncing {} proxies to PostgreSQL...", proxy_data_list.len());
+
+            match batch_insert_proxies(&pool, &proxy_data_list, batch_time).await {
+                Ok(_) => {
+                    // Clean up old records
+                    if let Err(e) = cleanup_old_proxies(&pool, batch_time).await {
+                        eprintln!("⚠️ Failed to cleanup old proxies: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("⚠️ Failed to sync to PostgreSQL: {}", e);
+                }
+            }
+        }
     } else {
         println!("No active proxies found");
     }
@@ -251,6 +307,105 @@ fn load_firehol_cidrs(file_path: &str) -> Vec<IpNetwork> {
 // 检查 IP 是否在 CIDR 网段内
 fn is_ip_in_cidr_list(ip: IpAddr, cidrs: &[IpNetwork]) -> bool {
     cidrs.iter().any(|network| network.contains(ip))
+}
+
+// 初始化 PostgreSQL 连接池
+fn create_pg_pool() -> Option<Pool> {
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => {
+            if url.is_empty() {
+                println!("Warning: DATABASE_URL is empty. PostgreSQL sync will be disabled.");
+                return None;
+            }
+            url
+        }
+        Err(_) => {
+            println!("Warning: DATABASE_URL not set. PostgreSQL sync will be disabled.");
+            return None;
+        }
+    };
+
+    let mut cfg = Config::new();
+    cfg.url = Some(database_url);
+    cfg.manager = Some(ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    });
+
+    match cfg.create_pool(Some(Runtime::Tokio1), NoTls) {
+        Ok(pool) => {
+            println!("✅ PostgreSQL connection pool created successfully");
+            Some(pool)
+        }
+        Err(e) => {
+            eprintln!("⚠️ Failed to create PostgreSQL connection pool: {}. Sync will be disabled.", e);
+            None
+        }
+    }
+}
+
+// 批量写入代理数据到 PostgreSQL
+async fn batch_insert_proxies(pool: &Pool, proxies: &[ProxyData], batch_time: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    if proxies.is_empty() {
+        return Ok(());
+    }
+
+    let client = pool.get().await?;
+
+    // 开始事务
+    let transaction = client.transaction().await?;
+
+    // 批量插入（使用 UPSERT 策略）
+    let stmt = transaction.prepare(
+        "INSERT INTO proxies (ip, port, country_code, country_name, city_code, city_name, asn_number, org_name, updated_at)
+         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (ip, port)
+         DO UPDATE SET
+            country_code = EXCLUDED.country_code,
+            country_name = EXCLUDED.country_name,
+            city_code = EXCLUDED.city_code,
+            city_name = EXCLUDED.city_name,
+            asn_number = EXCLUDED.asn_number,
+            org_name = EXCLUDED.org_name,
+            updated_at = EXCLUDED.updated_at"
+    ).await?;
+
+    let mut inserted = 0;
+    for proxy in proxies {
+        transaction.execute(
+            &stmt,
+            &[
+                &proxy.ip,
+                &(proxy.port as i32),
+                &proxy.country_code,
+                &proxy.country_name,
+                &proxy.city_code,
+                &proxy.city_name,
+                &proxy.asn_number,
+                &proxy.org_name,
+                &batch_time,
+            ],
+        ).await?;
+        inserted += 1;
+    }
+
+    // 提交事务
+    transaction.commit().await?;
+
+    println!("✅ Inserted/Updated {} proxies to PostgreSQL", inserted);
+    Ok(())
+}
+
+// 清理旧数据（保留本次更新的数据）
+async fn cleanup_old_proxies(pool: &Pool, batch_time: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    let client = pool.get().await?;
+
+    let rows_deleted = client.execute(
+        "DELETE FROM proxies WHERE updated_at < $1",
+        &[&batch_time],
+    ).await?;
+
+    println!("✅ Cleaned up {} old proxy records from PostgreSQL", rows_deleted);
+    Ok(())
 }
 
 async fn check_connection(

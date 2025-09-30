@@ -1,0 +1,76 @@
+# 示例：带 PostgreSQL 同步的代理扫描 Workflow
+# 将此文件重命名为 .yml 并配置 DATABASE_URL secret 后使用
+
+name: Proxy Scanner with PostgreSQL
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # 每 6 小时运行一次
+
+jobs:
+  scan-and-sync:
+    runs-on: ubuntu-latest
+    name: 🔍 Scan Proxies and Sync to PostgreSQL
+
+    steps:
+    - name: 📂 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GIT_TOKEN }}
+
+    - name: 🦀 Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: 📦 Cache Cargo Dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: 🔨 Build Release
+      run: cargo build --release
+
+    - name: 🚀 Run Proxy Scanner with PostgreSQL Sync
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        echo "Starting proxy scanner with PostgreSQL integration..."
+        ./target/release/cekproxy
+
+    - name: 📊 Check Results
+      run: |
+        if [ -f Data/alive.txt ]; then
+          echo "✅ Found $(wc -l < Data/alive.txt) active proxies"
+          echo "📋 Sample proxies:"
+          head -5 Data/alive.txt
+        else
+          echo "⚠️ No alive.txt file generated"
+        fi
+
+    - name: 📤 Commit and Push Changes
+      if: ${{ success() }}
+      run: |
+        git config --global user.name "Github Actions"
+        git config --global user.email "actions@github.com"
+
+        git add Data/alive.txt
+
+        if git diff --staged --quiet; then
+          echo "ℹ️ No changes to commit"
+        else
+          timestamp=$(date -u +"%Y-%m-%d %H:%M UTC")
+          git commit -m "🔄 Update proxy list - ${timestamp}"
+          git push origin main
+          echo "✅ Successfully updated proxy list"
+        fi
+      shell: bash

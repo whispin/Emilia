@@ -22,23 +22,64 @@ jobs:
     - name: 🛠️ Install Rust Toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: 📦 Cache Cargo Dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: 📦 Build Rust Project (Release)
       run: cargo build --release
 
     - name: 🧪 Give Execute Permission to Binary
       run: chmod +x ./target/release/cekproxy
 
-    - name: 🚀 Run Rust Binary
-      run: ./target/release/cekproxy
-
-    - name: 📤 Commit and Push Changes
-      if: ${{ success() }}
+    - name: 🚀 Run Rust Binary with PostgreSQL Sync
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
       run: |
-        git config --global user.name "Github Actions"
-        git config --global user.email "actions@github.com"
-        git add Data/alive.txt
-        git commit -m " 🔁 Update proxyip"
-        git push origin main --force
-      shell: bash
+        echo "Starting proxy scanner..."
+        echo "PostgreSQL Sync: $([ -n "$DATABASE_URL" ] && echo 'Enabled ✅' || echo 'Disabled ⚠️')"
+        ./target/release/cekproxy
+
+    - name: 📊 Check Scan Results
+      run: |
+        if [ -f Data/alive.txt ]; then
+          PROXY_COUNT=$(wc -l < Data/alive.txt)
+          echo "✅ Found $PROXY_COUNT active proxies"
+          echo ""
+          echo "📋 Sample proxies (first 5):"
+          head -5 Data/alive.txt
+          echo ""
+          echo "📈 Statistics:"
+          echo "  Total proxies: $PROXY_COUNT"
+          echo "  File size: $(du -h Data/alive.txt | cut -f1)"
+
+          # Country distribution
+          if [ "$PROXY_COUNT" -gt 0 ]; then
+            echo ""
+            echo "🌍 Top 5 countries:"
+            cut -d',' -f3 Data/alive.txt | sort | uniq -c | sort -rn | head -5 || true
+          fi
+
+          # Database sync status
+          if [ -n "${{ secrets.DATABASE_URL }}" ]; then
+            echo ""
+            echo "💾 Database: Synced ✅"
+          else
+            echo ""
+            echo "💾 Database: Not configured ⚠️"
+          fi
+        else
+          echo "⚠️ No alive.txt file generated"
+          exit 1
+        fi
 
 

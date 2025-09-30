@@ -22,3 +22,8 @@ maxminddb = "0.24"
 
 # IP address and CIDR handling
 ipnetwork = "0.20"
+
+# PostgreSQL async client
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+chrono = "0.4"
