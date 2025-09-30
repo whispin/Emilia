@@ -1,0 +1,126 @@
+name: FireHOL CIDR Blocklist Update
+
+on:
+  workflow_dispatch: # Allow manual trigger
+  schedule:
+    - cron: '30 5,11,17,23 * * *'  # Run at 5:30, 11:30, 17:30, 23:30 UTC daily
+
+jobs:
+  update-blocklist:
+    runs-on: ubuntu-latest
+    name: 📥 Download FireHOL Level 1 Blocklist
+
+    steps:
+    - name: 📂 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GIT_TOKEN }}
+
+    - name: 📁 Ensure Data Directory Exists
+      run: mkdir -p Data
+
+    - name: 📥 Download FireHOL Level 1 Blocklist
+      run: |
+        echo "Downloading FireHOL Level 1 blocklist (IPv4 CIDR ranges)..."
+
+        # FireHOL blocklist URL
+        BLOCKLIST_URL="https://raw.githubusercontent.com/ktsaou/blocklist-ipsets/master/firehol_level1.netset"
+
+        # Download the blocklist
+        HTTP_CODE=$(curl -L "${BLOCKLIST_URL}" \
+          -w "%{http_code}" \
+          -o firehol_raw.txt \
+          -s)
+
+        echo "HTTP Status: $HTTP_CODE"
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "❌ Failed to download FireHOL blocklist with HTTP $HTTP_CODE"
+          exit 1
+        fi
+
+        if [ ! -f firehol_raw.txt ] || [ ! -s firehol_raw.txt ]; then
+          echo "❌ Downloaded file is empty or missing"
+          exit 1
+        fi
+
+        echo "✅ FireHOL blocklist downloaded successfully"
+        echo "📊 Total lines: $(wc -l < firehol_raw.txt)"
+
+    - name: 🔄 Clean Comments and Process CIDR List
+      run: |
+        echo "Cleaning comments and extracting CIDR ranges..."
+
+        # Remove comment lines (starting with #) and empty lines
+        grep -v '^#' firehol_raw.txt | grep -v '^[[:space:]]*$' > Data/firehol_cidr.txt
+
+        if [ ! -f Data/firehol_cidr.txt ]; then
+          echo "❌ Failed to create firehol_cidr.txt"
+          exit 1
+        fi
+
+        echo "✅ Processing completed successfully"
+        echo "📊 Total CIDR ranges: $(wc -l < Data/firehol_cidr.txt)"
+        echo ""
+        echo "📋 Sample of first 5 entries:"
+        head -5 Data/firehol_cidr.txt
+
+        # Cleanup temporary file
+        rm -f firehol_raw.txt
+
+    - name: 📊 Verify Output File
+      run: |
+        echo "Verifying firehol_cidr.txt format..."
+
+        if [ ! -f Data/firehol_cidr.txt ]; then
+          echo "❌ firehol_cidr.txt not found"
+          exit 1
+        fi
+
+        # Check file has content
+        line_count=$(wc -l < Data/firehol_cidr.txt)
+        if [ "$line_count" -lt 1 ]; then
+          echo "❌ firehol_cidr.txt is empty"
+          exit 1
+        fi
+
+        echo "✅ File verification passed"
+        echo "📈 Statistics:"
+        echo "   Total CIDR ranges: $line_count"
+        echo "   File size: $(du -h Data/firehol_cidr.txt | cut -f1)"
+
+        # Show sample of CIDR ranges
+        echo ""
+        echo "📋 Sample CIDR ranges:"
+        head -10 Data/firehol_cidr.txt
+
+        # Show /24 and /16 network distribution
+        echo ""
+        echo "🌐 Network size distribution:"
+        echo "   /32 (single IP): $(grep -c '/32' Data/firehol_cidr.txt)"
+        echo "   /24 networks: $(grep -c '/24' Data/firehol_cidr.txt)"
+        echo "   /16 networks: $(grep -c '/16' Data/firehol_cidr.txt)"
+        echo "   Other sizes: $(grep -v -c '/32\|/24\|/16' Data/firehol_cidr.txt)"
+
+    - name: 📤 Commit and Push Changes
+      if: ${{ success() }}
+      run: |
+        git config --global user.name "Github Actions"
+        git config --global user.email "actions@github.com"
+
+        # Add the blocklist file
+        git add Data/firehol_cidr.txt
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "ℹ️ No changes to commit - blocklist is up to date"
+        else
+          # Get current timestamp
+          timestamp=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          git commit -m "🚫 Update FireHOL CIDR blocklist - ${timestamp}"
+          git push origin main
+          echo "✅ Successfully updated FireHOL CIDR blocklist"
+        fi
+      shell: bash
