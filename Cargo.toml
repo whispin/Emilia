@@ -19,3 +19,6 @@ serde_json = "1.0"
 
 # MaxMind GeoIP2 database reader
 maxminddb = "0.24"
+
+# IP address and CIDR handling
+ipnetwork = "0.20"

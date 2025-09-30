@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write}; // Read dihapus karena AsyncReadExt akan digunakan
 use std::net::IpAddr;
@@ -6,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use ipnetwork::IpNetwork;
 use maxminddb::{geoip2, Reader};
 use native_tls::TlsConnector as NativeTlsConnector; // Renamed to avoid conflict
 use serde_json::Value;
@@ -20,8 +22,10 @@ const OUTPUT_FILE: &str = "Data/alive.txt";
 const COUNTRY_DB: &str = "Data/GeoLite2-Country.mmdb";
 const CITY_DB: &str = "Data/GeoLite2-City.mmdb";
 const ANONYMOUS_IP_DB: &str = "Data/GeoIP2-Anonymous-IP.mmdb";
+const ABUSE_IP_FILE: &str = "Data/abuseips.txt";
+const FIREHOL_CIDR_FILE: &str = "Data/firehol_cidr.txt";
 const MAX_CONCURRENT: usize = 175;
-const TIMEOUT_SECONDS: u64 =9;
+const TIMEOUT_SECONDS: u64 = 9;
 
 // Define a custom error type that implements Send + SData/ProxyIP2Agustus.txtync
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -61,6 +65,12 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Load AbuseIPDB blacklist
+    let abuse_ips = Arc::new(load_abuse_ips(ABUSE_IP_FILE));
+
+    // Load FireHOL CIDR blocklist
+    let firehol_cidrs = Arc::new(load_firehol_cidrs(FIREHOL_CIDR_FILE));
 
     // Clear output file before starting
     // File::create akan mengosongkan file jika sudah ada atau membuatnya jika belum
@@ -109,6 +119,8 @@ async fn main() -> Result<()> {
             let country_reader = Arc::clone(&country_reader);
             let city_reader = city_reader.clone();
             let anonymous_reader = anonymous_reader.clone();
+            let abuse_ips = Arc::clone(&abuse_ips);
+            let firehol_cidrs = Arc::clone(&firehol_cidrs);
 
             // tokio::spawn akan menjalankan setiap future process_proxy secara independen
             // Ini adalah cara yang lebih idiomatik untuk menjalankan banyak tugas async di Tokio
@@ -119,7 +131,16 @@ async fn main() -> Result<()> {
             // Untuk I/O bound seperti ini, buffer_unordered sudah cukup.
             // Mari kita tetap dengan struktur asli untuk kesederhanaan, karena buffer_unordered sudah menangani konkurensi.
             async move {
-                process_proxy(proxy_line, &original_ip, &active_proxies, &country_reader, city_reader.as_deref(), anonymous_reader.as_deref()).await;
+                process_proxy(
+                    proxy_line,
+                    &original_ip,
+                    &active_proxies,
+                    &country_reader,
+                    city_reader.as_deref(),
+                    anonymous_reader.as_deref(),
+                    &abuse_ips,
+                    &firehol_cidrs,
+                ).await;
             }
         })
     ).buffer_unordered(MAX_CONCURRENT).collect::<Vec<()>>();
@@ -155,6 +176,66 @@ fn read_proxy_file(file_path: &str) -> io::Result<Vec<String>> {
     }
 
     Ok(proxies)
+}
+
+// 读取 AbuseIPDB 黑名单 IP 列表
+fn load_abuse_ips(file_path: &str) -> HashSet<IpAddr> {
+    let mut abuse_ips = HashSet::new();
+
+    match File::open(file_path) {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    // 格式: ip,country_code,abuse_confidence_score
+                    let parts: Vec<&str> = line.split(',').collect();
+                    if !parts.is_empty() {
+                        if let Ok(ip) = parts[0].trim().parse::<IpAddr>() {
+                            abuse_ips.insert(ip);
+                        }
+                    }
+                }
+            }
+            println!("Loaded {} abuse IPs from {}", abuse_ips.len(), file_path);
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not load abuse IP list ({}): {}. Abuse IP filtering will be disabled.", file_path, e);
+        }
+    }
+
+    abuse_ips
+}
+
+// 读取 FireHOL CIDR 网段列表
+fn load_firehol_cidrs(file_path: &str) -> Vec<IpNetwork> {
+    let mut cidrs = Vec::new();
+
+    match File::open(file_path) {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        if let Ok(network) = line.parse::<IpNetwork>() {
+                            cidrs.push(network);
+                        }
+                    }
+                }
+            }
+            println!("Loaded {} CIDR ranges from {}", cidrs.len(), file_path);
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not load FireHOL CIDR list ({}): {}. CIDR filtering will be disabled.", file_path, e);
+        }
+    }
+
+    cidrs
+}
+
+// 检查 IP 是否在 CIDR 网段内
+fn is_ip_in_cidr_list(ip: IpAddr, cidrs: &[IpNetwork]) -> bool {
+    cidrs.iter().any(|network| network.contains(ip))
 }
 
 async fn check_connection(
@@ -346,6 +427,8 @@ async fn process_proxy(
     country_reader: &Reader<Vec<u8>>,
     city_reader: Option<&Reader<Vec<u8>>>,
     anonymous_reader: Option<&Reader<Vec<u8>>>,
+    abuse_ips: &HashSet<IpAddr>,
+    firehol_cidrs: &[IpNetwork],
 ) {
     let parts: Vec<&str> = proxy_line.split(',').collect();
     if parts.len() < 4 {
@@ -370,6 +453,15 @@ async fn process_proxy(
         Ok(proxy_data) => {
             if let Some(Value::String(proxy_ip)) = proxy_data.get("clientIp") {
                 if proxy_ip != original_ip {
+                    // 解析 IP 地址用于过滤检查
+                    let ip_addr = match ip.parse::<IpAddr>() {
+                        Ok(addr) => addr,
+                        Err(_) => {
+                            println!("CF PROXY FILTERED 🚫 (Invalid IP format): {}:{}", ip, port_num);
+                            return;
+                        }
+                    };
+
                     // 检查是否为匿名IP（VPN/公共代理/Tor）- 仅当数据库可用时
                     if let Some(anon_reader) = anonymous_reader {
                         let (is_anonymous, reason) = is_anonymous_ip(anon_reader, ip);
@@ -378,6 +470,18 @@ async fn process_proxy(
                             println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
                             return;
                         }
+                    }
+
+                    // 检查是否在 AbuseIPDB 黑名单中
+                    if !abuse_ips.is_empty() && abuse_ips.contains(&ip_addr) {
+                        println!("CF PROXY FILTERED 🚫 (AbuseIPDB 黑名单): {}:{}", ip, port_num);
+                        return;
+                    }
+
+                    // 检查是否在 FireHOL CIDR 黑名单中
+                    if !firehol_cidrs.is_empty() && is_ip_in_cidr_list(ip_addr, firehol_cidrs) {
+                        println!("CF PROXY FILTERED 🚫 (FireHOL CIDR 黑名单): {}:{}", ip, port_num);
+                        return;
                     }
 
                     // 获取地理位置信息
