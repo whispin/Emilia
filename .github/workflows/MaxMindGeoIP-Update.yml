@@ -96,21 +96,46 @@ jobs:
           exit 1
         fi
 
-    - name: 📥 Download GeoIP2-Anonymous-IP (Fallback Mirror)
+    - name: 📥 Download GeoIP2-Anonymous-IP Database (Official)
+      env:
+        MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
       run: |
-        echo "Downloading GeoIP2-Anonymous-IP.mmdb from mirror..."
-        echo "ℹ️ Note: Anonymous-IP database is not available in free GeoLite2"
-        echo "ℹ️ Using community mirror as fallback"
+        echo "Downloading GeoIP2-Anonymous-IP.mmdb from MaxMind official API..."
+        echo "ℹ️ Note: This requires a paid MaxMind GeoIP2 subscription"
 
-        # Download from P3TERX mirror
-        curl -L "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoIP2-Anonymous-IP.mmdb" \
-          -o Data/GeoIP2-Anonymous-IP.mmdb
+        # MaxMind official download URL format for GeoIP2-Anonymous-IP
+        DOWNLOAD_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoIP2-Anonymous-IP&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+
+        # Download and extract
+        curl -L "${DOWNLOAD_URL}" -o GeoIP2-Anonymous-IP.tar.gz
+
+        if [ ! -f GeoIP2-Anonymous-IP.tar.gz ]; then
+          echo "⚠️ Failed to download GeoIP2-Anonymous-IP.tar.gz - may require paid subscription"
+          echo "ℹ️ Skipping Anonymous-IP database (filtering will be disabled)"
+          exit 0
+        fi
+
+        # Validate response is actually gzip
+        if ! file GeoIP2-Anonymous-IP.tar.gz | grep -q "gzip compressed"; then
+          echo "⚠️ Downloaded file is not gzip format. This may require a paid GeoIP2 subscription."
+          echo "Response content (first 200 chars):"
+          head -c 200 GeoIP2-Anonymous-IP.tar.gz
+          rm -f GeoIP2-Anonymous-IP.tar.gz
+          echo "ℹ️ Skipping Anonymous-IP database (filtering will be disabled)"
+          exit 0
+        fi
+
+        # Extract .mmdb file from tar.gz
+        tar -xzf GeoIP2-Anonymous-IP.tar.gz --strip-components=1 --wildcards '*.mmdb'
+        mv GeoIP2-Anonymous-IP.mmdb Data/
+        rm -f GeoIP2-Anonymous-IP.tar.gz
 
         if [ -f Data/GeoIP2-Anonymous-IP.mmdb ]; then
           echo "✅ GeoIP2-Anonymous-IP.mmdb downloaded successfully"
           ls -lh Data/GeoIP2-Anonymous-IP.mmdb
         else
-          echo "⚠️ GeoIP2-Anonymous-IP.mmdb download failed - skipping"
+          echo "⚠️ Failed to extract GeoIP2-Anonymous-IP.mmdb"
+          echo "ℹ️ Anonymous-IP filtering will be disabled"
         fi
 
     - name: 📊 Verify Downloaded Files

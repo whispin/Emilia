@@ -50,9 +50,17 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Initialize Anonymous IP database reader
-    let anonymous_reader = Arc::new(Reader::open_readfile(ANONYMOUS_IP_DB)?);
-    println!("Loaded Anonymous IP database: {}", ANONYMOUS_IP_DB);
+    // Initialize Anonymous IP database reader (optional)
+    let anonymous_reader = match Reader::open_readfile(ANONYMOUS_IP_DB) {
+        Ok(reader) => {
+            println!("Loaded Anonymous IP database: {}", ANONYMOUS_IP_DB);
+            Some(Arc::new(reader))
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not load Anonymous IP database ({}): {}. Anonymous IP filtering will be disabled.", ANONYMOUS_IP_DB, e);
+            None
+        }
+    };
 
     // Clear output file before starting
     // File::create akan mengosongkan file jika sudah ada atau membuatnya jika belum
@@ -100,7 +108,7 @@ async fn main() -> Result<()> {
             let active_proxies = Arc::clone(&active_proxies);
             let country_reader = Arc::clone(&country_reader);
             let city_reader = city_reader.clone();
-            let anonymous_reader = Arc::clone(&anonymous_reader);
+            let anonymous_reader = anonymous_reader.clone();
 
             // tokio::spawn akan menjalankan setiap future process_proxy secara independen
             // Ini adalah cara yang lebih idiomatik untuk menjalankan banyak tugas async di Tokio
@@ -111,7 +119,7 @@ async fn main() -> Result<()> {
             // Untuk I/O bound seperti ini, buffer_unordered sudah cukup.
             // Mari kita tetap dengan struktur asli untuk kesederhanaan, karena buffer_unordered sudah menangani konkurensi.
             async move {
-                process_proxy(proxy_line, &original_ip, &active_proxies, &country_reader, city_reader.as_deref(), &anonymous_reader).await;
+                process_proxy(proxy_line, &original_ip, &active_proxies, &country_reader, city_reader.as_deref(), anonymous_reader.as_deref()).await;
             }
         })
     ).buffer_unordered(MAX_CONCURRENT).collect::<Vec<()>>();
@@ -337,7 +345,7 @@ async fn process_proxy(
     active_proxies: &Arc<Mutex<Vec<String>>>,
     country_reader: &Reader<Vec<u8>>,
     city_reader: Option<&Reader<Vec<u8>>>,
-    anonymous_reader: &Reader<Vec<u8>>,
+    anonymous_reader: Option<&Reader<Vec<u8>>>,
 ) {
     let parts: Vec<&str> = proxy_line.split(',').collect();
     if parts.len() < 4 {
@@ -362,12 +370,14 @@ async fn process_proxy(
         Ok(proxy_data) => {
             if let Some(Value::String(proxy_ip)) = proxy_data.get("clientIp") {
                 if proxy_ip != original_ip {
-                    // 检查是否为匿名IP（VPN/公共代理/Tor）
-                    let (is_anonymous, reason) = is_anonymous_ip(anonymous_reader, ip);
+                    // 检查是否为匿名IP（VPN/公共代理/Tor）- 仅当数据库可用时
+                    if let Some(anon_reader) = anonymous_reader {
+                        let (is_anonymous, reason) = is_anonymous_ip(anon_reader, ip);
 
-                    if is_anonymous {
-                        println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
-                        return;
+                        if is_anonymous {
+                            println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
+                            return;
+                        }
                     }
 
                     // 获取地理位置信息
