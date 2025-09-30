@@ -409,7 +409,7 @@ async fn batch_insert_proxies(pool: &Pool, proxies: &[ProxyData], batch_time: ch
     // 批量插入（使用 UPSERT 策略）
     let stmt = transaction.prepare(
         "INSERT INTO proxies (ip, port, country_code, country_name, city_code, city_name, asn_number, org_name, updated_at)
-         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (ip, port)
          DO UPDATE SET
             country_code = EXCLUDED.country_code,
