@@ -369,12 +369,14 @@ fn get_geo_info(
         Ok(country_data) => {
             let code = country_data
                 .country
+                .as_ref()
                 .and_then(|c| c.iso_code)
                 .unwrap_or("")
                 .to_string();
 
             let name = country_data
                 .country
+                .as_ref()
                 .and_then(|c| c.names)
                 .and_then(|names| {
                     names.get("zh-CN")
@@ -395,12 +397,14 @@ fn get_geo_info(
                 // GeoLite2 没有城市代码，使用城市名的英文作为代码
                 let code = city_data
                     .city
+                    .as_ref()
                     .and_then(|c| c.names)
                     .and_then(|names| names.get("en").map(|s| s.to_string()))
                     .unwrap_or_default();
 
                 let name = city_data
                     .city
+                    .as_ref()
                     .and_then(|c| c.names)
                     .and_then(|names| {
                         names.get("zh-CN")
