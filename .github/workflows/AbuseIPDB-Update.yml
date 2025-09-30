@@ -129,22 +129,30 @@ jobs:
         echo "Converting CSV to custom format: ip,country_code,abuse_confidence_score"
 
         # Process CSV and extract required fields
-        # Expected CSV format: ipAddress,abuseConfidenceScore[,countryCode]
+        # Expected CSV format: ip,country_code,abuse_confidence_score,last_reported_at
         # Output format: ip,country_code,abuse_confidence_score
 
         # Skip header and process each line
-        tail -n +2 abuseipdb_raw.csv | while IFS=',' read -r ip confidence country_code other_fields; do
+        tail -n +2 abuseipdb_raw.csv | awk -F',' '{
+          # Extract and clean fields
+          ip = $1
+          country_code = $2
+          confidence = $3
+
           # Remove quotes and whitespace
-          ip=$(echo "$ip" | tr -d '"' | xargs)
-          confidence=$(echo "$confidence" | tr -d '"' | xargs)
-          country_code=$(echo "$country_code" | tr -d '"' | xargs)
+          gsub(/"/, "", ip)
+          gsub(/"/, "", country_code)
+          gsub(/"/, "", confidence)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", country_code)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", confidence)
 
           # Set default country code if empty
-          [ -z "$country_code" ] && country_code="UNKNOWN"
+          if (country_code == "") country_code = "UNKNOWN"
 
           # Output in required format
-          echo "${ip},${country_code},${confidence}"
-        done > Data/abuseips.txt
+          print ip "," country_code "," confidence
+        }' > Data/abuseips.txt
 
         if [ ! -f Data/abuseips.txt ]; then
           echo "❌ Failed to create abuseips.txt"
