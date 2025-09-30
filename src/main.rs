@@ -137,20 +137,45 @@ async fn main() -> Result<()> {
 
     println!("Original IP: {}", original_ip);
 
-    // Store active proxies
+    // Store active proxies and proxy data for batch writing
     let active_proxies = Arc::new(Mutex::new(Vec::new()));
+    let proxy_data_batch = Arc::new(Mutex::new(Vec::<ProxyData>::new()));
+    let batch_counter = Arc::new(Mutex::new(0usize));
+    const BATCH_SIZE: usize = 50;
 
-    // Initialize PostgreSQL connection pool (optional)
-    let pg_pool = create_pg_pool();
+    // Initialize PostgreSQL connection pool (REQUIRED)
+    println!("🔌 Initializing PostgreSQL connection...");
+    let pg_pool = match create_pg_pool() {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("❌ Failed to create PostgreSQL connection pool: {}", e);
+            eprintln!("💡 Please configure DATABASE_URL and ensure database is accessible");
+            std::process::exit(1);
+        }
+    };
+
+    // Test database connection (REQUIRED)
+    if let Err(e) = test_database_connection(&pg_pool).await {
+        eprintln!("❌ Database connection test failed: {}", e);
+        eprintln!("💡 Please check: DATABASE_URL, network connectivity, and run schema.sql");
+        std::process::exit(1);
+    }
+    println!("✅ Database ready for sync");
 
     // Generate batch timestamp for this run
     let batch_time = chrono::Utc::now();
+
+    // Share pool across tasks
+    let pg_pool_shared = Arc::new(pg_pool);
 
     // Process proxies concurrently
     let tasks = futures::stream::iter(
         proxies.into_iter().map(|proxy_line| {
             let original_ip = original_ip.clone();
             let active_proxies = Arc::clone(&active_proxies);
+            let proxy_data_batch = Arc::clone(&proxy_data_batch);
+            let batch_counter = Arc::clone(&batch_counter);
+            let pg_pool_clone = Arc::clone(&pg_pool_shared);
             let country_reader = Arc::clone(&country_reader);
             let city_reader = city_reader.clone();
             let asn_reader = asn_reader.clone();
@@ -171,6 +196,10 @@ async fn main() -> Result<()> {
                     proxy_line,
                     &original_ip,
                     &active_proxies,
+                    &proxy_data_batch,
+                    &batch_counter,
+                    &pg_pool_clone,
+                    batch_time,
                     &country_reader,
                     city_reader.as_deref(),
                     asn_reader.as_deref(),
@@ -184,48 +213,32 @@ async fn main() -> Result<()> {
 
     tasks.await;
 
-    // Save active proxies to file and parse for PostgreSQL
-    let active_proxies_locked = active_proxies.lock().unwrap(); // Renamed for clarity
-    if !active_proxies_locked.is_empty() {
-        let mut file = File::create(OUTPUT_FILE)?; // Buka lagi untuk menulis, ini akan menimpa
-        let mut proxy_data_list = Vec::new();
+    // Write final batch if any remaining proxies
+    {
+        let batch = proxy_data_batch.lock().unwrap();
+        if !batch.is_empty() {
+            println!("📤 Writing final batch of {} proxies to PostgreSQL...", batch.len());
+            match batch_insert_proxies(&pg_pool_shared, &batch, batch_time).await {
+                Ok(_) => println!("✅ Final batch written successfully"),
+                Err(e) => eprintln!("❌ Failed to write final batch: {}", e),
+            }
+        }
+    }
 
+    // Clean up old records
+    match cleanup_old_proxies(&pg_pool_shared, batch_time).await {
+        Ok(_) => println!("✅ Database cleanup completed"),
+        Err(e) => eprintln!("❌ Failed to cleanup old proxies: {}", e),
+    }
+
+    // Save active proxies to file
+    let active_proxies_locked = active_proxies.lock().unwrap();
+    if !active_proxies_locked.is_empty() {
+        let mut file = File::create(OUTPUT_FILE)?;
         for proxy_csv in active_proxies_locked.iter() {
             writeln!(file, "{}", proxy_csv)?;
-
-            // Parse CSV untuk PostgreSQL
-            let parts: Vec<&str> = proxy_csv.split(',').collect();
-            if parts.len() >= 8 {
-                proxy_data_list.push(ProxyData {
-                    ip: parts[0].to_string(),
-                    port: parts[1].parse().unwrap_or(0),
-                    country_code: parts[2].to_string(),
-                    country_name: parts[3].to_string(),
-                    city_code: parts[4].to_string(),
-                    city_name: parts[5].to_string(),
-                    asn_number: parts[6].to_string(),
-                    org_name: parts[7].to_string(),
-                });
-            }
         }
-        println!("All active proxies saved to {}", OUTPUT_FILE);
-
-        // Sync to PostgreSQL if available
-        if let Some(pool) = pg_pool {
-            println!("📤 Syncing {} proxies to PostgreSQL...", proxy_data_list.len());
-
-            match batch_insert_proxies(&pool, &proxy_data_list, batch_time).await {
-                Ok(_) => {
-                    // Clean up old records
-                    if let Err(e) = cleanup_old_proxies(&pool, batch_time).await {
-                        eprintln!("⚠️ Failed to cleanup old proxies: {}", e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("⚠️ Failed to sync to PostgreSQL: {}", e);
-                }
-            }
-        }
+        println!("✅ All active proxies saved to {}", OUTPUT_FILE);
     } else {
         println!("No active proxies found");
     }
@@ -309,19 +322,18 @@ fn is_ip_in_cidr_list(ip: IpAddr, cidrs: &[IpNetwork]) -> bool {
     cidrs.iter().any(|network| network.contains(ip))
 }
 
-// 初始化 PostgreSQL 连接池
-fn create_pg_pool() -> Option<Pool> {
+// 初始化 PostgreSQL 连接池（必需）
+fn create_pg_pool() -> Result<Pool> {
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => {
             if url.is_empty() {
-                println!("Warning: DATABASE_URL is empty. PostgreSQL sync will be disabled.");
-                return None;
+                return Err("DATABASE_URL is empty. PostgreSQL connection is required.".into());
             }
+            println!("✅ DATABASE_URL configured: {}...", &url.chars().take(20).collect::<String>());
             url
         }
         Err(_) => {
-            println!("Warning: DATABASE_URL not set. PostgreSQL sync will be disabled.");
-            return None;
+            return Err("DATABASE_URL not set. PostgreSQL connection is required.".into());
         }
     };
 
@@ -334,13 +346,52 @@ fn create_pg_pool() -> Option<Pool> {
     match cfg.create_pool(Some(Runtime::Tokio1), NoTls) {
         Ok(pool) => {
             println!("✅ PostgreSQL connection pool created successfully");
-            Some(pool)
+            Ok(pool)
         }
         Err(e) => {
-            eprintln!("⚠️ Failed to create PostgreSQL connection pool: {}. Sync will be disabled.", e);
-            None
+            Err(format!("Failed to create PostgreSQL connection pool: {}", e).into())
         }
     }
+}
+
+// 测试数据库连接并验证表结构
+async fn test_database_connection(pool: &Pool) -> Result<()> {
+    println!("🔍 Testing database connection...");
+
+    let client = pool.get().await.map_err(|e| {
+        eprintln!("❌ Failed to get database client: {}", e);
+        e
+    })?;
+
+    println!("✅ Database connection successful");
+
+    // Check if proxies table exists
+    let table_check = client.query(
+        "SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'proxies'
+        )",
+        &[]
+    ).await?;
+
+    if let Some(row) = table_check.first() {
+        let exists: bool = row.get(0);
+        if exists {
+            println!("✅ Table 'proxies' exists");
+
+            // Get row count
+            let count_result = client.query("SELECT COUNT(*) FROM proxies", &[]).await?;
+            if let Some(row) = count_result.first() {
+                let count: i64 = row.get(0);
+                println!("📊 Current proxy count in database: {}", count);
+            }
+        } else {
+            eprintln!("❌ Table 'proxies' does not exist! Please run schema.sql first.");
+            return Err("Table 'proxies' not found".into());
+        }
+    }
+
+    Ok(())
 }
 
 // 批量写入代理数据到 PostgreSQL
@@ -645,6 +696,10 @@ async fn process_proxy(
     proxy_line: String,
     original_ip: &str,
     active_proxies: &Arc<Mutex<Vec<String>>>,
+    proxy_data_batch: &Arc<Mutex<Vec<ProxyData>>>,
+    batch_counter: &Arc<Mutex<usize>>,
+    pg_pool: &Arc<Pool>,
+    batch_time: chrono::DateTime<chrono::Utc>,
     country_reader: &Reader<Vec<u8>>,
     city_reader: Option<&Reader<Vec<u8>>>,
     asn_reader: Option<&Reader<Vec<u8>>>,
@@ -679,7 +734,7 @@ async fn process_proxy(
                     let ip_addr = match ip.parse::<IpAddr>() {
                         Ok(addr) => addr,
                         Err(_) => {
-                            println!("CF PROXY FILTERED 🚫 (Invalid IP format): {}:{}", ip, port_num);
+                            //println!("CF PROXY FILTERED 🚫 (Invalid IP format): {}:{}", ip, port_num);
                             return;
                         }
                     };
@@ -689,20 +744,20 @@ async fn process_proxy(
                         let (is_anonymous, reason) = is_anonymous_ip(anon_reader, ip);
 
                         if is_anonymous {
-                            println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
+                            //println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
                             return;
                         }
                     }
 
                     // 检查是否在 AbuseIPDB 黑名单中
                     if !abuse_ips.is_empty() && abuse_ips.contains(&ip_addr) {
-                        println!("CF PROXY FILTERED 🚫 (AbuseIPDB 黑名单): {}:{}", ip, port_num);
+                        //println!("CF PROXY FILTERED 🚫 (AbuseIPDB 黑名单): {}:{}", ip, port_num);
                         return;
                     }
 
                     // 检查是否在 FireHOL CIDR 黑名单中
                     if !firehol_cidrs.is_empty() && is_ip_in_cidr_list(ip_addr, firehol_cidrs) {
-                        println!("CF PROXY FILTERED 🚫 (FireHOL CIDR 黑名单): {}:{}", ip, port_num);
+                       // println!("CF PROXY FILTERED 🚫 (FireHOL CIDR 黑名单): {}:{}", ip, port_num);
                         return;
                     }
 
@@ -726,17 +781,62 @@ async fn process_proxy(
                     );
                     println!("CF PROXY LIVE ✅: {}", proxy_entry);
 
-                    let mut active_proxies_locked = active_proxies.lock().unwrap();
-                    active_proxies_locked.push(proxy_entry);
+                    // Add to active proxies for file output
+                    {
+                        let mut active_proxies_locked = active_proxies.lock().unwrap();
+                        active_proxies_locked.push(proxy_entry);
+                    }
+
+                    // Add to batch for PostgreSQL
+                    let proxy_data = ProxyData {
+                        ip: ip.to_string(),
+                        port: port_num,
+                        country_code: country_code.clone(),
+                        country_name: country_name.clone(),
+                        city_code: city_code.clone(),
+                        city_name: city_name.clone(),
+                        asn_number: asn_number.clone(),
+                        org_name: org_name.clone(),
+                    };
+
+                    {
+                        let mut batch = proxy_data_batch.lock().unwrap();
+                        batch.push(proxy_data);
+
+                        let mut counter = batch_counter.lock().unwrap();
+                        *counter += 1;
+
+                        // Trigger batch write when reaching BATCH_SIZE (50)
+                        if *counter >= 50 {
+                            println!("📤 Writing batch of {} proxies to PostgreSQL...", batch.len());
+
+                            // Clone data for async write
+                            let batch_to_write = batch.clone();
+                            let pool_clone = Arc::clone(pg_pool);
+
+                            // Clear batch and reset counter
+                            batch.clear();
+                            *counter = 0;
+
+                            // Spawn async task to write batch
+                            tokio::spawn(async move {
+                                if let Err(e) = batch_insert_proxies(&pool_clone, &batch_to_write, batch_time).await {
+                                    eprintln!("❌ Failed to write batch to PostgreSQL: {}", e);
+                                } else {
+                                    println!("✅ Batch write completed successfully");
+                                }
+                            });
+                        }
+                    }
                 } else {
-                    println!("CF PROXY DEAD ❌ (Same IP as original): {}:{}", ip, port_num);
+                   // println!("CF PROXY DEAD ❌ (Same IP as original): {}:{}", ip, port_num);
                 }
             } else {
-                println!("CF PROXY DEAD ❌ (No clientIp field in response): {}:{} - Response: {:?}", ip, port_num, proxy_data);
+               // println!("CF PROXY DEAD ❌ (No clientIp field in response): {}:{} - Response: {:?}", ip, port_num, proxy_data);
             }
         },
         Err(e) => {
-            println!("CF PROXY DEAD ⏱️ (Error connecting): {}:{} - {}", ip, port_num, e);
+           // println!("CF PROXY DEAD ⏱️ (Error connecting): {}:{} - {}", ip, port_num, e);
         }
     }
 }

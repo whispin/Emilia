@@ -45,9 +45,18 @@ jobs:
       env:
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
       run: |
+        echo "═══════════════════════════════════════"
         echo "Starting proxy scanner..."
         echo "PostgreSQL Sync: $([ -n "$DATABASE_URL" ] && echo 'Enabled ✅' || echo 'Disabled ⚠️')"
+        echo "═══════════════════════════════════════"
         ./target/release/cekproxy
+        echo ""
+        echo "═══════════════════════════════════════"
+        echo "Scan completed. Check output above for:"
+        echo "  ✅ Database ready for sync"
+        echo "  ✅ Successfully synced X proxies"
+        echo "  ❌ Any error messages"
+        echo "═══════════════════════════════════════"
 
     - name: 📊 Check Scan Results
       run: |
