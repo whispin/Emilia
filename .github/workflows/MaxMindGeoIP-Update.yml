@@ -96,6 +96,44 @@ jobs:
           exit 1
         fi
 
+    - name: 📥 Download GeoLite2-ASN Database (Official)
+      env:
+        MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+      run: |
+        echo "Downloading GeoLite2-ASN.mmdb from MaxMind official API..."
+
+        # MaxMind official download URL format
+        DOWNLOAD_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+
+        # Download and extract
+        curl -L "${DOWNLOAD_URL}" -o GeoLite2-ASN.tar.gz
+
+        if [ ! -f GeoLite2-ASN.tar.gz ]; then
+          echo "❌ Failed to download GeoLite2-ASN.tar.gz"
+          exit 1
+        fi
+
+        # Validate response is actually gzip
+        if ! file GeoLite2-ASN.tar.gz | grep -q "gzip compressed"; then
+          echo "❌ Downloaded file is not gzip format. Response content:"
+          cat GeoLite2-ASN.tar.gz
+          rm -f GeoLite2-ASN.tar.gz
+          exit 1
+        fi
+
+        # Extract .mmdb file from tar.gz
+        tar -xzf GeoLite2-ASN.tar.gz --strip-components=1 --wildcards '*.mmdb'
+        mv GeoLite2-ASN.mmdb Data/
+        rm -f GeoLite2-ASN.tar.gz
+
+        if [ -f Data/GeoLite2-ASN.mmdb ]; then
+          echo "✅ GeoLite2-ASN.mmdb downloaded successfully"
+          ls -lh Data/GeoLite2-ASN.mmdb
+        else
+          echo "❌ Failed to extract GeoLite2-ASN.mmdb"
+          exit 1
+        fi
+
     - name: 📥 Download GeoIP2-Anonymous-IP Database (Official)
       env:
         MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
@@ -148,6 +186,7 @@ jobs:
         echo "📈 File sizes:"
         [ -f Data/GeoLite2-Country.mmdb ] && du -h Data/GeoLite2-Country.mmdb || echo "❌ GeoLite2-Country.mmdb missing"
         [ -f Data/GeoLite2-City.mmdb ] && du -h Data/GeoLite2-City.mmdb || echo "❌ GeoLite2-City.mmdb missing"
+        [ -f Data/GeoLite2-ASN.mmdb ] && du -h Data/GeoLite2-ASN.mmdb || echo "❌ GeoLite2-ASN.mmdb missing"
         [ -f Data/GeoIP2-Anonymous-IP.mmdb ] && du -h Data/GeoIP2-Anonymous-IP.mmdb || echo "⚠️ GeoIP2-Anonymous-IP.mmdb missing"
 
         echo ""
@@ -163,6 +202,7 @@ jobs:
         # Add the downloaded databases
         git add Data/GeoLite2-Country.mmdb
         git add Data/GeoLite2-City.mmdb
+        git add Data/GeoLite2-ASN.mmdb
         git add Data/GeoIP2-Anonymous-IP.mmdb 2>/dev/null || true
 
         # Check if there are changes to commit
