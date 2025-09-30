@@ -141,7 +141,8 @@ async fn main() -> Result<()> {
     let active_proxies = Arc::new(Mutex::new(Vec::new()));
     let proxy_data_batch = Arc::new(Mutex::new(Vec::<ProxyData>::new()));
     let batch_counter = Arc::new(Mutex::new(0usize));
-    const BATCH_SIZE: usize = 50;
+    // Batch size for incremental PostgreSQL writes
+    // Note: Used as literal value (50) in line 832 condition check
 
     // Initialize PostgreSQL connection pool (REQUIRED)
     println!("🔌 Initializing PostgreSQL connection...");
@@ -552,6 +553,7 @@ async fn check_connection(
 }
 
 
+#[allow(dead_code)]
 fn clean_org_name(org_name: &str) -> String {
     org_name.chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
@@ -741,7 +743,7 @@ async fn process_proxy(
 
                     // 检查是否为匿名IP（VPN/公共代理/Tor）- 仅当数据库可用时
                     if let Some(anon_reader) = anonymous_reader {
-                        let (is_anonymous, reason) = is_anonymous_ip(anon_reader, ip);
+                        let (is_anonymous, _reason) = is_anonymous_ip(anon_reader, ip);
 
                         if is_anonymous {
                             //println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
@@ -835,8 +837,8 @@ async fn process_proxy(
                // println!("CF PROXY DEAD ❌ (No clientIp field in response): {}:{} - Response: {:?}", ip, port_num, proxy_data);
             }
         },
-        Err(e) => {
-           // println!("CF PROXY DEAD ⏱️ (Error connecting): {}:{} - {}", ip, port_num, e);
+        Err(_e) => {
+           // println!("CF PROXY DEAD ⏱️ (Error connecting): {}:{} - {}", ip, port_num, _e);
         }
     }
 }
