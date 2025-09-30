@@ -265,8 +265,11 @@ fn get_geo_info(
             country_data
                 .country
                 .and_then(|c| c.names)
-                .and_then(|names| names.get("zh-CN").or(names.get("en")))
-                .map(|s| s.to_string())
+                .and_then(|names| {
+                    names.get("zh-CN")
+                        .or_else(|| names.get("en"))
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| "未知".to_string())
         }
         Err(_) => "未知".to_string(),
@@ -279,8 +282,11 @@ fn get_geo_info(
                 city_data
                     .city
                     .and_then(|c| c.names)
-                    .and_then(|names| names.get("zh-CN").or(names.get("en")))
-                    .map(|s| s.to_string())
+                    .and_then(|names| {
+                        names.get("zh-CN")
+                            .or_else(|| names.get("en"))
+                            .map(|s| s.to_string())
+                    })
                     .unwrap_or_else(|| "未知".to_string())
             }
             Err(_) => "未知".to_string(),
@@ -304,7 +310,7 @@ fn is_anonymous_ip(
 
     match anonymous_reader.lookup::<geoip2::AnonymousIp>(ip) {
         Ok(anonymous_data) => {
-            let is_vpn = anonymous_data.is_vpn.unwrap_or(false);
+            let is_vpn = anonymous_data.is_anonymous_vpn.unwrap_or(false);
             let is_proxy = anonymous_data.is_public_proxy.unwrap_or(false);
             let is_tor = anonymous_data.is_tor_exit_node.unwrap_or(false);
 
@@ -341,8 +347,8 @@ async fn process_proxy(
 
     let ip = parts[0];
     let port_str = parts[1]; // Renamed to avoid conflict with port_num
-    let country = parts[2];
-    let org = parts[3];
+    let _country = parts[2]; // 保留以备将来使用
+    let _org = parts[3]; // 保留以备将来使用
 
     let port_num = match port_str.parse::<u16>() {
         Ok(p) => p,
