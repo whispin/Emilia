@@ -21,6 +21,7 @@ const PROXY_FILE: &str = "Data/emeliaProxyIP15AGS.txt"; //input
 const OUTPUT_FILE: &str = "Data/alive.txt";
 const COUNTRY_DB: &str = "Data/GeoLite2-Country.mmdb";
 const CITY_DB: &str = "Data/GeoLite2-City.mmdb";
+const ASN_DB: &str = "Data/GeoLite2-ASN.mmdb";
 const ANONYMOUS_IP_DB: &str = "Data/GeoIP2-Anonymous-IP.mmdb";
 const ABUSE_IP_FILE: &str = "Data/abuseips.txt";
 const FIREHOL_CIDR_FILE: &str = "Data/firehol_cidr.txt";
@@ -50,6 +51,18 @@ async fn main() -> Result<()> {
         }
         Err(e) => {
             eprintln!("Warning: Could not load City database ({}): {}. City info will show as '未知'.", CITY_DB, e);
+            None
+        }
+    };
+
+    // Initialize ASN database reader (optional)
+    let asn_reader = match Reader::open_readfile(ASN_DB) {
+        Ok(reader) => {
+            println!("Loaded ASN database: {}", ASN_DB);
+            Some(Arc::new(reader))
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not load ASN database ({}): {}. ASN info will show as empty.", ASN_DB, e);
             None
         }
     };
@@ -118,6 +131,7 @@ async fn main() -> Result<()> {
             let active_proxies = Arc::clone(&active_proxies);
             let country_reader = Arc::clone(&country_reader);
             let city_reader = city_reader.clone();
+            let asn_reader = asn_reader.clone();
             let anonymous_reader = anonymous_reader.clone();
             let abuse_ips = Arc::clone(&abuse_ips);
             let firehol_cidrs = Arc::clone(&firehol_cidrs);
@@ -137,6 +151,7 @@ async fn main() -> Result<()> {
                     &active_proxies,
                     &country_reader,
                     city_reader.as_deref(),
+                    asn_reader.as_deref(),
                     anonymous_reader.as_deref(),
                     &abuse_ips,
                     &firehol_cidrs,
@@ -338,20 +353,27 @@ fn clean_org_name(org_name: &str) -> String {
 }
 
 // 查询 IP 地理位置信息
+// 返回: (国家代码, 国家名, 城市代码, 城市名)
 fn get_geo_info(
     country_reader: &Reader<Vec<u8>>,
     city_reader: Option<&Reader<Vec<u8>>>,
     ip_str: &str,
-) -> (String, String) {
+) -> (String, String, String, String) {
     let ip: IpAddr = match ip_str.parse() {
         Ok(ip) => ip,
-        Err(_) => return ("未知".to_string(), "未知".to_string()),
+        Err(_) => return (String::new(), String::new(), String::new(), String::new()),
     };
 
     // 查询国家信息
-    let country = match country_reader.lookup::<geoip2::Country>(ip) {
+    let (country_code, country_name) = match country_reader.lookup::<geoip2::Country>(ip) {
         Ok(country_data) => {
-            country_data
+            let code = country_data
+                .country
+                .and_then(|c| c.iso_code)
+                .unwrap_or("")
+                .to_string();
+
+            let name = country_data
                 .country
                 .and_then(|c| c.names)
                 .and_then(|names| {
@@ -359,16 +381,25 @@ fn get_geo_info(
                         .or_else(|| names.get("en"))
                         .map(|s| s.to_string())
                 })
-                .unwrap_or_else(|| "未知".to_string())
+                .unwrap_or_default();
+
+            (code, name)
         }
-        Err(_) => "未知".to_string(),
+        Err(_) => (String::new(), String::new()),
     };
 
     // 查询城市信息（如果有城市数据库）
-    let city = if let Some(reader) = city_reader {
+    let (city_code, city_name) = if let Some(reader) = city_reader {
         match reader.lookup::<geoip2::City>(ip) {
             Ok(city_data) => {
-                city_data
+                // GeoLite2 没有城市代码，使用城市名的英文作为代码
+                let code = city_data
+                    .city
+                    .and_then(|c| c.names)
+                    .and_then(|names| names.get("en").map(|s| s.to_string()))
+                    .unwrap_or_default();
+
+                let name = city_data
                     .city
                     .and_then(|c| c.names)
                     .and_then(|names| {
@@ -376,15 +407,46 @@ fn get_geo_info(
                             .or_else(|| names.get("en"))
                             .map(|s| s.to_string())
                     })
-                    .unwrap_or_else(|| "未知".to_string())
+                    .unwrap_or_default();
+
+                (code, name)
             }
-            Err(_) => "未知".to_string(),
+            Err(_) => (String::new(), String::new()),
         }
     } else {
-        "未知".to_string()
+        (String::new(), String::new())
     };
 
-    (country, city)
+    (country_code, country_name, city_code, city_name)
+}
+
+// 查询 ASN 信息
+// 返回: (ASN 编号, 组织名)
+fn get_asn_info(
+    asn_reader: &Reader<Vec<u8>>,
+    ip_str: &str,
+) -> (String, String) {
+    let ip: IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return (String::new(), String::new()),
+    };
+
+    match asn_reader.lookup::<geoip2::Asn>(ip) {
+        Ok(asn_data) => {
+            let asn_number = asn_data
+                .autonomous_system_number
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+
+            let org_name = asn_data
+                .autonomous_system_organization
+                .unwrap_or("")
+                .to_string();
+
+            (asn_number, org_name)
+        }
+        Err(_) => (String::new(), String::new()),
+    }
 }
 
 // 检查 IP 是否为匿名代理（VPN/公共代理/Tor）
@@ -426,6 +488,7 @@ async fn process_proxy(
     active_proxies: &Arc<Mutex<Vec<String>>>,
     country_reader: &Reader<Vec<u8>>,
     city_reader: Option<&Reader<Vec<u8>>>,
+    asn_reader: Option<&Reader<Vec<u8>>>,
     anonymous_reader: Option<&Reader<Vec<u8>>>,
     abuse_ips: &HashSet<IpAddr>,
     firehol_cidrs: &[IpNetwork],
@@ -485,13 +548,22 @@ async fn process_proxy(
                     }
 
                     // 获取地理位置信息
-                    let (geo_country, geo_city) = get_geo_info(country_reader, city_reader, ip);
+                    let (country_code, country_name, city_code, city_name) =
+                        get_geo_info(country_reader, city_reader, ip);
 
-                    // 新格式: ip:port#国家名-城市名-ip-port
-                    let proxy_entry = format!("{}:{}#{}-{}-{}-{}",
+                    // 获取 ASN 信息
+                    let (asn_number, org_name) = if let Some(reader) = asn_reader {
+                        get_asn_info(reader, ip)
+                    } else {
+                        (String::new(), String::new())
+                    };
+
+                    // CSV 格式: ip,port,国家代码,国家名,城市代码,城市名,ASN编号,组织名
+                    let proxy_entry = format!("{},{},{},{},{},{},{},{}",
                         ip, port_num,
-                        geo_country, geo_city,
-                        ip, port_num
+                        country_code, country_name,
+                        city_code, city_name,
+                        asn_number, org_name
                     );
                     println!("CF PROXY LIVE ✅: {}", proxy_entry);
 
