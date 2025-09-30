@@ -349,7 +349,7 @@ async fn batch_insert_proxies(pool: &Pool, proxies: &[ProxyData], batch_time: ch
         return Ok(());
     }
 
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
 
     // 开始事务
     let transaction = client.transaction().await?;
