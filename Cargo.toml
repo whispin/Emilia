@@ -16,3 +16,6 @@ tokio-native-tls = "0.3"
 # dan Anda mungkin memerlukan fitur 'derive' untuk struct kustom.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# MaxMind GeoIP2 database reader
+maxminddb = "0.24"

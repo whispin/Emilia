@@ -1,10 +1,12 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write}; // Read dihapus karena AsyncReadExt akan digunakan
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use maxminddb::{geoip2, Reader};
 use native_tls::TlsConnector as NativeTlsConnector; // Renamed to avoid conflict
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Untuk read_exact, write_all async
@@ -15,6 +17,9 @@ const IP_RESOLVER: &str = "speed.cloudflare.com";
 const PATH_RESOLVER: &str = "/meta";
 const PROXY_FILE: &str = "Data/emeliaProxyIP15AGS.txt"; //input
 const OUTPUT_FILE: &str = "Data/alive.txt";
+const COUNTRY_DB: &str = "Data/GeoLite2-Country.mmdb";
+const CITY_DB: &str = "Data/GeoLite2-City.mmdb";
+const ANONYMOUS_IP_DB: &str = "Data/GeoIP2-Anonymous-IP.mmdb";
 const MAX_CONCURRENT: usize = 175;
 const TIMEOUT_SECONDS: u64 =9;
 
@@ -29,6 +34,25 @@ async fn main() -> Result<()> {
     if let Some(parent) = Path::new(OUTPUT_FILE).parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // Initialize GeoIP database readers
+    let country_reader = Arc::new(Reader::open_readfile(COUNTRY_DB)?);
+    println!("Loaded Country database: {}", COUNTRY_DB);
+
+    let city_reader = match Reader::open_readfile(CITY_DB) {
+        Ok(reader) => {
+            println!("Loaded City database: {}", CITY_DB);
+            Some(Arc::new(reader))
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not load City database ({}): {}. City info will show as '未知'.", CITY_DB, e);
+            None
+        }
+    };
+
+    // Initialize Anonymous IP database reader
+    let anonymous_reader = Arc::new(Reader::open_readfile(ANONYMOUS_IP_DB)?);
+    println!("Loaded Anonymous IP database: {}", ANONYMOUS_IP_DB);
 
     // Clear output file before starting
     // File::create akan mengosongkan file jika sudah ada atau membuatnya jika belum
@@ -74,6 +98,9 @@ async fn main() -> Result<()> {
         proxies.into_iter().map(|proxy_line| {
             let original_ip = original_ip.clone();
             let active_proxies = Arc::clone(&active_proxies);
+            let country_reader = Arc::clone(&country_reader);
+            let city_reader = city_reader.clone();
+            let anonymous_reader = Arc::clone(&anonymous_reader);
 
             // tokio::spawn akan menjalankan setiap future process_proxy secara independen
             // Ini adalah cara yang lebih idiomatik untuk menjalankan banyak tugas async di Tokio
@@ -84,7 +111,7 @@ async fn main() -> Result<()> {
             // Untuk I/O bound seperti ini, buffer_unordered sudah cukup.
             // Mari kita tetap dengan struktur asli untuk kesederhanaan, karena buffer_unordered sudah menangani konkurensi.
             async move {
-                process_proxy(proxy_line, &original_ip, &active_proxies).await;
+                process_proxy(proxy_line, &original_ip, &active_proxies, &country_reader, city_reader.as_deref(), &anonymous_reader).await;
             }
         })
     ).buffer_unordered(MAX_CONCURRENT).collect::<Vec<()>>();
@@ -221,10 +248,90 @@ fn clean_org_name(org_name: &str) -> String {
         .collect()
 }
 
+// 查询 IP 地理位置信息
+fn get_geo_info(
+    country_reader: &Reader<Vec<u8>>,
+    city_reader: Option<&Reader<Vec<u8>>>,
+    ip_str: &str,
+) -> (String, String) {
+    let ip: IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return ("未知".to_string(), "未知".to_string()),
+    };
+
+    // 查询国家信息
+    let country = match country_reader.lookup::<geoip2::Country>(ip) {
+        Ok(country_data) => {
+            country_data
+                .country
+                .and_then(|c| c.names)
+                .and_then(|names| names.get("zh-CN").or(names.get("en")))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "未知".to_string())
+        }
+        Err(_) => "未知".to_string(),
+    };
+
+    // 查询城市信息（如果有城市数据库）
+    let city = if let Some(reader) = city_reader {
+        match reader.lookup::<geoip2::City>(ip) {
+            Ok(city_data) => {
+                city_data
+                    .city
+                    .and_then(|c| c.names)
+                    .and_then(|names| names.get("zh-CN").or(names.get("en")))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "未知".to_string())
+            }
+            Err(_) => "未知".to_string(),
+        }
+    } else {
+        "未知".to_string()
+    };
+
+    (country, city)
+}
+
+// 检查 IP 是否为匿名代理（VPN/公共代理/Tor）
+fn is_anonymous_ip(
+    anonymous_reader: &Reader<Vec<u8>>,
+    ip_str: &str,
+) -> (bool, String) {
+    let ip: IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return (false, "无法解析IP".to_string()),
+    };
+
+    match anonymous_reader.lookup::<geoip2::AnonymousIp>(ip) {
+        Ok(anonymous_data) => {
+            let is_vpn = anonymous_data.is_vpn.unwrap_or(false);
+            let is_proxy = anonymous_data.is_public_proxy.unwrap_or(false);
+            let is_tor = anonymous_data.is_tor_exit_node.unwrap_or(false);
+
+            if is_vpn || is_proxy || is_tor {
+                let mut reasons = Vec::new();
+                if is_vpn { reasons.push("VPN"); }
+                if is_proxy { reasons.push("公共代理"); }
+                if is_tor { reasons.push("Tor出口节点"); }
+                (true, reasons.join("+"))
+            } else {
+                (false, "正常IP".to_string())
+            }
+        }
+        Err(_) => {
+            // 数据库中没有记录，视为正常IP（不在匿名IP列表中）
+            (false, "未知(默认允许)".to_string())
+        }
+    }
+}
+
 async fn process_proxy(
     proxy_line: String,
     original_ip: &str,
     active_proxies: &Arc<Mutex<Vec<String>>>,
+    country_reader: &Reader<Vec<u8>>,
+    city_reader: Option<&Reader<Vec<u8>>>,
+    anonymous_reader: &Reader<Vec<u8>>,
 ) {
     let parts: Vec<&str> = proxy_line.split(',').collect();
     if parts.len() < 4 {
@@ -249,14 +356,23 @@ async fn process_proxy(
         Ok(proxy_data) => {
             if let Some(Value::String(proxy_ip)) = proxy_data.get("clientIp") {
                 if proxy_ip != original_ip {
-                    let org_name_from_response = if let Some(Value::String(org_val)) = proxy_data.get("asOrganization") {
-                        clean_org_name(org_val)
-                    } else {
-                        // Gunakan org dari file jika tidak ada di response, setelah dibersihkan
-                        clean_org_name(org)
-                    };
+                    // 检查是否为匿名IP（VPN/公共代理/Tor）
+                    let (is_anonymous, reason) = is_anonymous_ip(anonymous_reader, ip);
 
-                    let proxy_entry = format!("{},{},{},{}", ip, port_num, country, org_name_from_response);
+                    if is_anonymous {
+                        println!("CF PROXY FILTERED 🚫 (匿名IP: {}): {}:{}", reason, ip, port_num);
+                        return;
+                    }
+
+                    // 获取地理位置信息
+                    let (geo_country, geo_city) = get_geo_info(country_reader, city_reader, ip);
+
+                    // 新格式: ip:port#国家名-城市名-ip-port
+                    let proxy_entry = format!("{}:{}#{}-{}-{}-{}",
+                        ip, port_num,
+                        geo_country, geo_city,
+                        ip, port_num
+                    );
                     println!("CF PROXY LIVE ✅: {}", proxy_entry);
 
                     let mut active_proxies_locked = active_proxies.lock().unwrap();
