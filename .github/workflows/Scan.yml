@@ -10,7 +10,7 @@ on:
 jobs:
   update-proxies:
     runs-on: ubuntu-latest
-    name: 🔎 Scan Proxy Rust Binary
+    name: 🔎 Scan Rust Binary
 
     steps:
     - name: 📂 Checkout Repository
